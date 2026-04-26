@@ -2,9 +2,7 @@ name: AI X Bot Cron
 
 on:
   schedule:
-    # 5分おきに実行 (GitHub Actionsの最小単位)
     - cron: '*/5 * * * *'
-  # GitHubの画面から手動で実行できるようにする
   workflow_dispatch:
 
 jobs:
@@ -26,7 +24,6 @@ jobs:
 
       - name: Run Bot
         env:
-          # GitHubのリポジトリ設定 (Settings > Secrets and variables > Actions) で登録が必要です
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
