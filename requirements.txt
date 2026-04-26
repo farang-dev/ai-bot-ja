@@ -1,0 +1,7 @@
+tweepy
+openai
+python-dotenv
+fastapi
+uvicorn
+httpx
+supabase
