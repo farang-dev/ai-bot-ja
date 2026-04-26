@@ -93,7 +93,8 @@ class XBot:
                 ],
                 max_tokens=250
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            return content.strip() if content else None
         except Exception as e:
             print(f"Error with OpenRouter: {e}")
             return None
