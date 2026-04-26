@@ -1,11 +1,11 @@
 import os
 import re
-import httpx
+import feedparser
 import tweepy
 from openai import OpenAI
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import json
+from html import unescape
 
 load_dotenv()
 
@@ -23,6 +23,14 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 TARGET_USERNAMES = os.getenv("TARGET_USERNAMES", "OpenAI,anthropicai,GoogleAI,perplexity_ai").split(",")
+
+# Working Nitter Instances (Fallbacks)
+NITTER_INSTANCES = [
+    "https://nitter.privacyredirect.com",
+    "https://nitter.net",
+    "https://nitter.mint.lgbt",
+    "https://nitter.perennialte.ch"
+]
 
 class XBot:
     def __init__(self):
@@ -55,46 +63,14 @@ class XBot:
             "username": username
         }).execute()
 
-    def fetch_tweets_free(self, username):
-        """
-        Fetches tweets using X's official syndication API (no login/API key required for read).
-        This is much more stable than Nitter.
-        """
-        url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
-        try:
-            # Need to look like a real browser
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-            response = httpx.get(url, headers=headers)
-            if response.status_code != 200:
-                print(f"Failed to fetch {username}: HTTP {response.status_code}")
-                return []
-            
-            # Extract JSON from the HTML response (it's embedded in a script tag)
-            html = response.text
-            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
-            if not match:
-                print(f"Could not find data in response for {username}")
-                return []
-            
-            data = json.loads(match.group(1))
-            timeline = data.get("props", {}).get("pageProps", {}).get("timeline", {}).get("entries", [])
-            
-            tweets = []
-            for entry in timeline:
-                if entry.get("type") == "tweet":
-                    t_data = entry.get("content", {}).get("tweet", {})
-                    if t_data:
-                        tweets.append({
-                            "id": t_data.get("id_str"),
-                            "text": t_data.get("full_text"),
-                            "is_retweet": "retweeted_status" in t_data
-                        })
-            return tweets
-        except Exception as e:
-            print(f"Error fetching {username}: {e}")
-            return []
+    def clean_html(self, raw_html):
+        cleanr = re.compile('<.*?>')
+        cleantext = re.sub(cleanr, '', raw_html)
+        return unescape(cleantext)
+
+    def extract_tweet_id(self, link):
+        match = re.search(r'/status/(\d+)', link)
+        return match.group(1) if match else None
 
     def process_tweet_content(self, original_text):
         system_prompt = (
@@ -123,41 +99,60 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution (Syndication Mode - FREE)...")
+        print("Starting bot execution (Multi-RSS Mode - FREE)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
-            print(f"Checking updates for @{username}...")
+            success = False
             
-            tweets = self.fetch_tweets_free(username)
-            if not tweets:
-                print(f"No tweets found for @{username}.")
-                continue
-            
-            # Process from oldest to newest
-            for tweet in reversed(tweets[:5]):
-                tweet_id = tweet["id"]
-                if not tweet_id or self.is_already_processed(tweet_id):
-                    continue
-                
-                if tweet["is_retweet"]:
-                    print(f"Skipping retweet: {tweet_id}")
-                    self.mark_as_processed(tweet_id, username)
-                    continue
-
-                print(f"Processing new tweet: {tweet_id}")
-                jp_text = self.process_tweet_content(tweet["text"])
-                if not jp_text:
-                    continue
+            # Try multiple Nitter instances in case some are blocked
+            for instance in NITTER_INSTANCES:
+                print(f"Checking updates for @{username} via {instance}...")
+                rss_url = f"{instance}/{username}/rss"
                 
                 try:
-                    self.client.create_tweet(
-                        text=jp_text,
-                        quote_tweet_id=tweet_id
-                    )
-                    print(f"Successfully posted quote tweet for {tweet_id}")
-                    self.mark_as_processed(tweet_id, username)
+                    feed = feedparser.parse(rss_url)
+                    if not feed.entries:
+                        print(f"No entries found at {instance}. Trying next instance...")
+                        continue
+                    
+                    # Successfully fetched feed!
+                    success = True
+                    entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
+                    
+                    # Process entries
+                    for entry in entries[-5:]:
+                        tweet_id = self.extract_tweet_id(entry.link)
+                        if not tweet_id or self.is_already_processed(tweet_id):
+                            continue
+                        
+                        clean_text = self.clean_html(entry.description)
+                        if clean_text.startswith("RT by @"):
+                            print(f"Skipping retweet: {tweet_id}")
+                            self.mark_as_processed(tweet_id, username)
+                            continue
+
+                        print(f"Processing new tweet: {tweet_id}")
+                        jp_text = self.process_tweet_content(clean_text)
+                        if not jp_text:
+                            continue
+                        
+                        try:
+                            self.client.create_tweet(
+                                text=jp_text,
+                                quote_tweet_id=tweet_id
+                            )
+                            print(f"Successfully posted quote tweet for {tweet_id}")
+                            self.mark_as_processed(tweet_id, username)
+                        except Exception as e:
+                            print(f"Error posting tweet: {e}")
+                    
+                    break # Stop trying instances if we successfully processed this user
+                    
                 except Exception as e:
-                    print(f"Error posting tweet: {e}")
+                    print(f"Error with instance {instance}: {e}")
+            
+            if not success:
+                print(f"FATAL: All instances failed for @{username}.")
         
         print("Bot execution finished.")
 
