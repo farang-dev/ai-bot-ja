@@ -8,8 +8,6 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # ここに環境（env）の指定を追加しました
-    environment: env
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
