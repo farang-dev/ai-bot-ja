@@ -1,11 +1,11 @@
 import os
 import re
-import feedparser
+import httpx
 import tweepy
 from openai import OpenAI
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from html import unescape
+import json
 
 load_dotenv()
 
@@ -24,13 +24,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 TARGET_USERNAMES = os.getenv("TARGET_USERNAMES", "OpenAI,anthropicai,GoogleAI,perplexity_ai").split(",")
 
-# RSS Base URL (Nitter instance)
-# Note: Nitter instances can change. Using poast.org as default.
-NITTER_BASE_URL = os.getenv("NITTER_BASE_URL", "https://nitter.poast.org")
-
 class XBot:
     def __init__(self):
-        # Tweepy Client (Only for POSTING tweets in Free tier)
+        # Tweepy Client (For POSTING only)
         self.client = tweepy.Client(
             bearer_token=X_BEARER_TOKEN,
             consumer_key=X_API_KEY,
@@ -59,28 +55,57 @@ class XBot:
             "username": username
         }).execute()
 
-    def clean_html(self, raw_html):
-        """Removes HTML tags and decodes entities from RSS content."""
-        cleanr = re.compile('<.*?>')
-        cleantext = re.sub(cleanr, '', raw_html)
-        return unescape(cleantext)
-
-    def extract_tweet_id(self, link):
-        """Extracts the numerical tweet ID from a Nitter/X status URL."""
-        # Example: https://nitter.poast.org/OpenAI/status/1234567890#m
-        match = re.search(r'/status/(\d+)', link)
-        return match.group(1) if match else None
+    def fetch_tweets_free(self, username):
+        """
+        Fetches tweets using X's official syndication API (no login/API key required for read).
+        This is much more stable than Nitter.
+        """
+        url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
+        try:
+            # Need to look like a real browser
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            response = httpx.get(url, headers=headers)
+            if response.status_code != 200:
+                print(f"Failed to fetch {username}: HTTP {response.status_code}")
+                return []
+            
+            # Extract JSON from the HTML response (it's embedded in a script tag)
+            html = response.text
+            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+            if not match:
+                print(f"Could not find data in response for {username}")
+                return []
+            
+            data = json.loads(match.group(1))
+            timeline = data.get("props", {}).get("pageProps", {}).get("timeline", {}).get("entries", [])
+            
+            tweets = []
+            for entry in timeline:
+                if entry.get("type") == "tweet":
+                    t_data = entry.get("content", {}).get("tweet", {})
+                    if t_data:
+                        tweets.append({
+                            "id": t_data.get("id_str"),
+                            "text": t_data.get("full_text"),
+                            "is_retweet": "retweeted_status" in t_data
+                        })
+            return tweets
+        except Exception as e:
+            print(f"Error fetching {username}: {e}")
+            return []
 
     def process_tweet_content(self, original_text):
         system_prompt = (
             "あなたはAI技術の最新ニュースを日本語で伝えるニュースボットです。\n"
             "与えられた英語のツイート内容を、日本語で要約または翻訳してください。\n\n"
             "【制約事項】\n"
-            "1. 日本語の文字数は130文字以内に収めてください（Twitterの無料枠280文字制限のため）。\n"
-            "2. 内容は正確に、かつ日本のユーザーにとって有益な情報を優先してください。\n"
-            "3. 元のツイートが短い場合は直訳し、長い場合は重要なポイントを要約してください。\n"
-            "4. ハッシュタグは最小限（1-2個）にしてください。\n"
-            "5. 絵文字を適度に使って読みやすくしてください。"
+            "1. 日本語の文字数は130文字以内に収めてください。\n"
+            "2. 内容は正確に、かつ有益な情報を優先してください。\n"
+            "3. 短い場合は直訳、長い場合は要約してください。\n"
+            "4. ハッシュタグは最小限にしてください。\n"
+            "5. 絵文字を適度に使ってください。"
         )
         
         try:
@@ -98,61 +123,41 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution (RSS Mode)...")
+        print("Starting bot execution (Syndication Mode - FREE)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
-            print(f"Checking RSS updates for @{username}...")
+            print(f"Checking updates for @{username}...")
             
-            rss_url = f"{NITTER_BASE_URL}/{username}/rss"
+            tweets = self.fetch_tweets_free(username)
+            if not tweets:
+                print(f"No tweets found for @{username}.")
+                continue
             
-            try:
-                feed = feedparser.parse(rss_url)
-                
-                if not feed.entries:
-                    print(f"No entries found for @{username} (RSS might be down or account is quiet).")
+            # Process from oldest to newest
+            for tweet in reversed(tweets[:5]):
+                tweet_id = tweet["id"]
+                if not tweet_id or self.is_already_processed(tweet_id):
                     continue
                 
-                # Process entries from oldest to newest
-                entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
-                
-                # Limit to 5 most recent to avoid spam on first run
-                for entry in entries[-5:]:
-                    tweet_id = self.extract_tweet_id(entry.link)
-                    if not tweet_id:
-                        continue
-                        
-                    if self.is_already_processed(tweet_id):
-                        continue
-                    
-                    print(f"Processing new tweet via RSS: {tweet_id}")
-                    
-                    # Clean the content (RSS content often has HTML)
-                    clean_text = self.clean_html(entry.description)
-                    
-                    # Skip if it's a retweet (Nitter usually marks them)
-                    if clean_text.startswith("RT by @"):
-                        print(f"Skipping retweet: {tweet_id}")
-                        self.mark_as_processed(tweet_id, username)
-                        continue
+                if tweet["is_retweet"]:
+                    print(f"Skipping retweet: {tweet_id}")
+                    self.mark_as_processed(tweet_id, username)
+                    continue
 
-                    # AI Translation/Summary
-                    jp_text = self.process_tweet_content(clean_text)
-                    if not jp_text:
-                        continue
-                    
-                    # Post Quote Tweet (Writing is allowed in Free tier)
-                    try:
-                        self.client.create_tweet(
-                            text=jp_text,
-                            quote_tweet_id=tweet_id
-                        )
-                        print(f"Successfully posted quote tweet for {tweet_id}")
-                        self.mark_as_processed(tweet_id, username)
-                    except Exception as e:
-                        print(f"Error posting tweet: {e}")
+                print(f"Processing new tweet: {tweet_id}")
+                jp_text = self.process_tweet_content(tweet["text"])
+                if not jp_text:
+                    continue
                 
-            except Exception as e:
-                print(f"Error fetching RSS for @{username}: {e}")
+                try:
+                    self.client.create_tweet(
+                        text=jp_text,
+                        quote_tweet_id=tweet_id
+                    )
+                    print(f"Successfully posted quote tweet for {tweet_id}")
+                    self.mark_as_processed(tweet_id, username)
+                except Exception as e:
+                    print(f"Error posting tweet: {e}")
         
         print("Bot execution finished.")
 
