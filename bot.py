@@ -1,8 +1,11 @@
 import os
+import re
+import feedparser
 import tweepy
 from openai import OpenAI
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from html import unescape
 
 load_dotenv()
 
@@ -21,9 +24,13 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 TARGET_USERNAMES = os.getenv("TARGET_USERNAMES", "OpenAI,anthropicai,GoogleAI,perplexity_ai").split(",")
 
+# RSS Base URL (Nitter instance)
+# Note: Nitter instances can change. Using poast.org as default.
+NITTER_BASE_URL = os.getenv("NITTER_BASE_URL", "https://nitter.poast.org")
+
 class XBot:
     def __init__(self):
-        # Tweepy Client for v2 API
+        # Tweepy Client (Only for POSTING tweets in Free tier)
         self.client = tweepy.Client(
             bearer_token=X_BEARER_TOKEN,
             consumer_key=X_API_KEY,
@@ -43,44 +50,28 @@ class XBot:
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     def is_already_processed(self, tweet_id: str):
-        """Checks if the tweet ID has already been processed in Supabase."""
         response = self.supabase.table("processed_tweets").select("tweet_id").eq("tweet_id", str(tweet_id)).execute()
         return len(response.data) > 0
 
     def mark_as_processed(self, tweet_id: str, username: str):
-        """Records the tweet ID in Supabase to avoid future duplicates."""
         self.supabase.table("processed_tweets").insert({
             "tweet_id": str(tweet_id),
             "username": username
         }).execute()
 
-    def get_last_processed_id(self, username: str):
-        """Fetches the latest tweet ID we processed for this user to optimize API calls."""
-        response = self.supabase.table("processed_tweets") \
-            .select("tweet_id") \
-            .eq("username", username) \
-            .order("tweet_id", desc=True) \
-            .limit(1) \
-            .execute()
-        
-        if response.data:
-            return response.data[0]["tweet_id"]
-        return None
+    def clean_html(self, raw_html):
+        """Removes HTML tags and decodes entities from RSS content."""
+        cleanr = re.compile('<.*?>')
+        cleantext = re.sub(cleanr, '', raw_html)
+        return unescape(cleantext)
 
-    def get_user_id(self, username):
-        try:
-            user = self.client.get_user(username=username)
-            if user.data:
-                return user.data.id
-        except Exception as e:
-            print(f"Error fetching user ID for {username}: {e}")
-        return None
+    def extract_tweet_id(self, link):
+        """Extracts the numerical tweet ID from a Nitter/X status URL."""
+        # Example: https://nitter.poast.org/OpenAI/status/1234567890#m
+        match = re.search(r'/status/(\d+)', link)
+        return match.group(1) if match else None
 
     def process_tweet_content(self, original_text):
-        """
-        Uses OpenRouter to translate/summarize the tweet into Japanese.
-        Ensures it fits within the 140-character limit for Japanese tweets.
-        """
         system_prompt = (
             "あなたはAI技術の最新ニュースを日本語で伝えるニュースボットです。\n"
             "与えられた英語のツイート内容を、日本語で要約または翻訳してください。\n\n"
@@ -107,62 +98,61 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution...")
+        print("Starting bot execution (RSS Mode)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
-            print(f"Checking updates for @{username}...")
+            print(f"Checking RSS updates for @{username}...")
             
-            user_id = self.get_user_id(username)
-            if not user_id:
-                continue
-            
-            last_id = self.get_last_processed_id(username)
+            rss_url = f"{NITTER_BASE_URL}/{username}/rss"
             
             try:
-                # Fetch recent tweets
-                kwargs = {"max_results": 10, "tweet_fields": ["id", "text", "created_at"]}
-                if last_id:
-                    kwargs["since_id"] = last_id
+                feed = feedparser.parse(rss_url)
                 
-                tweets = self.client.get_users_tweets(user_id, **kwargs)
-                
-                if not tweets.data:
-                    print(f"No new tweets for @{username}.")
+                if not feed.entries:
+                    print(f"No entries found for @{username} (RSS might be down or account is quiet).")
                     continue
                 
-                # Process tweets from oldest to newest
-                new_tweets = sorted(tweets.data, key=lambda x: x.id)
+                # Process entries from oldest to newest
+                entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
                 
-                for tweet in new_tweets:
-                    # 1. Double check against DB (Safety First)
-                    if self.is_already_processed(tweet.id):
-                        print(f"Tweet {tweet.id} already processed. Skipping.")
+                # Limit to 5 most recent to avoid spam on first run
+                for entry in entries[-5:]:
+                    tweet_id = self.extract_tweet_id(entry.link)
+                    if not tweet_id:
+                        continue
+                        
+                    if self.is_already_processed(tweet_id):
                         continue
                     
-                    print(f"Processing new tweet: {tweet.id}")
+                    print(f"Processing new tweet via RSS: {tweet_id}")
                     
-                    # 2. AI Translation/Summary
-                    jp_text = self.process_tweet_content(tweet.text)
+                    # Clean the content (RSS content often has HTML)
+                    clean_text = self.clean_html(entry.description)
+                    
+                    # Skip if it's a retweet (Nitter usually marks them)
+                    if clean_text.startswith("RT by @"):
+                        print(f"Skipping retweet: {tweet_id}")
+                        self.mark_as_processed(tweet_id, username)
+                        continue
+
+                    # AI Translation/Summary
+                    jp_text = self.process_tweet_content(clean_text)
                     if not jp_text:
                         continue
                     
-                    # 3. Post Quote Tweet
+                    # Post Quote Tweet (Writing is allowed in Free tier)
                     try:
                         self.client.create_tweet(
                             text=jp_text,
-                            quote_tweet_id=tweet.id
+                            quote_tweet_id=tweet_id
                         )
-                        print(f"Successfully posted quote tweet for {tweet.id}")
-                        
-                        # 4. Mark as processed in DB
-                        self.mark_as_processed(tweet.id, username)
+                        print(f"Successfully posted quote tweet for {tweet_id}")
+                        self.mark_as_processed(tweet_id, username)
                     except Exception as e:
                         print(f"Error posting tweet: {e}")
-                        # Even if posting fails, we might want to skip it next time or retry?
-                        # Usually it's better NOT to mark as processed if it failed.
                 
             except Exception as e:
-                print(f"Error fetching tweets for @{username}: {e}")
+                print(f"Error fetching RSS for @{username}: {e}")
         
         print("Bot execution finished.")
 
