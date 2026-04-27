@@ -2,6 +2,7 @@ import os
 import re
 import feedparser
 import tweepy
+import time
 from openai import OpenAI
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -14,7 +15,6 @@ X_API_KEY = os.getenv("X_API_KEY")
 X_API_SECRET = os.getenv("X_API_SECRET")
 X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
-X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
@@ -34,14 +34,19 @@ NITTER_INSTANCES = [
 
 class XBot:
     def __init__(self):
-        # Tweepy Client (For POSTING only)
-        self.client = tweepy.Client(
-            bearer_token=X_BEARER_TOKEN,
+        # Tweepy Auth (OAuth 1.0a)
+        auth = tweepy.OAuth1UserHandler(
+            X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
+        )
+        # v1.1 API (Older but more stable for some Free accounts)
+        self.api = tweepy.API(auth)
+        
+        # v2 Client (Fallback if v1.1 fails)
+        self.client_v2 = tweepy.Client(
             consumer_key=X_API_KEY,
             consumer_secret=X_API_SECRET,
             access_token=X_ACCESS_TOKEN,
-            access_token_secret=X_ACCESS_SECRET,
-            wait_on_rate_limit=True
+            access_token_secret=X_ACCESS_SECRET
         )
         
         # OpenRouter Client
@@ -100,12 +105,11 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution (Multi-RSS Mode - FREE)...")
+        print("Starting bot execution (Hybrid Mode - FREE)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
             success = False
             
-            # Try multiple Nitter instances in case some are blocked
             for instance in NITTER_INSTANCES:
                 print(f"Checking updates for @{username} via {instance}...")
                 rss_url = f"{instance}/{username}/rss"
@@ -113,14 +117,11 @@ class XBot:
                 try:
                     feed = feedparser.parse(rss_url)
                     if not feed.entries:
-                        print(f"No entries found at {instance}. Trying next instance...")
                         continue
                     
-                    # Successfully fetched feed!
                     success = True
                     entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
                     
-                    # Process entries
                     for entry in entries[-5:]:
                         tweet_id = self.extract_tweet_id(entry.link)
                         if not tweet_id or self.is_already_processed(tweet_id):
@@ -128,7 +129,6 @@ class XBot:
                         
                         clean_text = self.clean_html(entry.description)
                         if clean_text.startswith("RT by @"):
-                            print(f"Skipping retweet: {tweet_id}")
                             self.mark_as_processed(tweet_id, username)
                             continue
 
@@ -137,28 +137,33 @@ class XBot:
                         if not jp_text:
                             continue
                         
+                        tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+                        full_text = f"{jp_text}\n\n{tweet_url}"
+                        
                         try:
-                            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-                            full_text = f"{jp_text}\n\n{tweet_url}"
-                            
-                            self.client.create_tweet(
-                                text=full_text
-                            )
-                            print(f"Successfully posted tweet for {tweet_id}")
+                            # Try v1.1 first
+                            self.api.update_status(status=full_text)
+                            print(f"Successfully posted (v1.1) for {tweet_id}")
                             self.mark_as_processed(tweet_id, username)
-                            
-                            # Wait 5 seconds between posts to avoid rate limit
                             time.sleep(5)
-                        except Exception as e:
-                            print(f"Error posting tweet {tweet_id}: {e}")
+                        except Exception as e1:
+                            print(f"v1.1 failed, trying v2: {e1}")
+                            try:
+                                # Try v2 as fallback
+                                self.client_v2.create_tweet(text=full_text)
+                                print(f"Successfully posted (v2) for {tweet_id}")
+                                self.mark_as_processed(tweet_id, username)
+                                time.sleep(5)
+                            except Exception as e2:
+                                print(f"Both v1.1 and v2 failed for {tweet_id}: {e2}")
                     
-                    break # Stop trying instances if we successfully processed this user
+                    break
                     
                 except Exception as e:
                     print(f"Error with instance {instance}: {e}")
             
             if not success:
-                print(f"FATAL: All instances failed for @{username}.")
+                print(f"No connection for @{username}.")
         
         print("Bot execution finished.")
 
