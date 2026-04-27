@@ -146,8 +146,11 @@ class XBot:
                             )
                             print(f"Successfully posted tweet for {tweet_id}")
                             self.mark_as_processed(tweet_id, username)
+                            
+                            # Wait 5 seconds between posts to avoid rate limit
+                            time.sleep(5)
                         except Exception as e:
-                            print(f"Error posting tweet: {e}")
+                            print(f"Error posting tweet {tweet_id}: {e}")
                     
                     break # Stop trying instances if we successfully processed this user
                     
