@@ -138,11 +138,13 @@ class XBot:
                             continue
                         
                         try:
+                            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+                            full_text = f"{jp_text}\n\n{tweet_url}"
+                            
                             self.client.create_tweet(
-                                text=jp_text,
-                                quote_tweet_id=tweet_id
+                                text=full_text
                             )
-                            print(f"Successfully posted quote tweet for {tweet_id}")
+                            print(f"Successfully posted tweet for {tweet_id}")
                             self.mark_as_processed(tweet_id, username)
                         except Exception as e:
                             print(f"Error posting tweet: {e}")
