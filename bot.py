@@ -10,11 +10,14 @@ from html import unescape
 
 load_dotenv()
 
-# Configuration
+# Configuration (OAuth 1.0a)
 X_API_KEY = os.getenv("X_API_KEY")
 X_API_SECRET = os.getenv("X_API_SECRET")
 X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
+
+# Configuration (OAuth 2.0)
+X_OAUTH2_ACCESS_TOKEN = os.getenv("X_OAUTH2_ACCESS_TOKEN")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
@@ -34,15 +37,22 @@ NITTER_INSTANCES = [
 
 class XBot:
     def __init__(self):
-        # Tweepy Client v2 (Standard for Free tier)
-        # Note: We use OAuth 1.0a User Context for posting.
-        self.client = tweepy.Client(
+        # OAuth 1.0a Client (Post v2)
+        self.client_v1a = tweepy.Client(
             consumer_key=X_API_KEY,
             consumer_secret=X_API_SECRET,
             access_token=X_ACCESS_TOKEN,
             access_token_secret=X_ACCESS_SECRET,
             wait_on_rate_limit=True
         )
+        
+        # OAuth 2.0 Client (Post v2) - if token is provided
+        self.client_v2 = None
+        if X_OAUTH2_ACCESS_TOKEN:
+            self.client_v2 = tweepy.Client(
+                access_token=X_OAUTH2_ACCESS_TOKEN,
+                wait_on_rate_limit=True
+            )
         
         # OpenRouter Client
         self.ai_client = OpenAI(
@@ -107,7 +117,7 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution (X API v2 Mode - FREE)...")
+        print("Starting bot execution (OAuth 1.0a + 2.0 Hybrid Mode)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
             print(f"Checking @{username}...")
@@ -121,7 +131,6 @@ class XBot:
                         continue
                     
                     success = True
-                    # Process entries (limit to avoid spam)
                     entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
                     for entry in entries[-3:]:
                         tweet_id = self.extract_tweet_id(entry.link)
@@ -141,21 +150,35 @@ class XBot:
                         tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
                         full_text = f"{jp_text}\n\n{tweet_url}"
                         
-                        try:
-                            # Use v2 API (The only one that works for posting on Free tier)
-                            self.client.create_tweet(text=full_text)
-                            print(f"Successfully posted for {tweet_id}")
-                            self.mark_as_processed(tweet_id, username)
-                            time.sleep(10) # 念のため10秒空ける
-                        except Exception as e:
-                            print(f"Post failed: {e}")
-                    
+                        # Try OAuth 2.0 first if available
+                        posted = False
+                        if self.client_v2:
+                            try:
+                                self.client_v2.create_tweet(text=full_text)
+                                print(f"Successfully posted (OAuth 2.0) for {tweet_id}")
+                                self.mark_as_processed(tweet_id, username)
+                                posted = True
+                                time.sleep(10)
+                            except Exception as e2:
+                                print(f"OAuth 2.0 failed: {e2}")
+
+                        # Fallback to OAuth 1.0a
+                        if not posted:
+                            try:
+                                self.client_v1a.create_tweet(text=full_text)
+                                print(f"Successfully posted (OAuth 1.0a) for {tweet_id}")
+                                self.mark_as_processed(tweet_id, username)
+                                posted = True
+                                time.sleep(10)
+                            except Exception as e1a:
+                                print(f"OAuth 1.0a failed: {e1a}")
+
                     break
                 except Exception as e:
                     print(f"Error with {instance}: {e}")
             
             if not success:
-                print(f"Failed to fetch @{username} from all instances.")
+                print(f"Failed to fetch @{username}.")
         
         print("Bot execution finished.")
 
