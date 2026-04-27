@@ -34,19 +34,14 @@ NITTER_INSTANCES = [
 
 class XBot:
     def __init__(self):
-        # Tweepy Auth (OAuth 1.0a)
-        auth = tweepy.OAuth1UserHandler(
-            X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
-        )
-        # v1.1 API (Older but more stable for some Free accounts)
-        self.api = tweepy.API(auth)
-        
-        # v2 Client (Fallback if v1.1 fails)
-        self.client_v2 = tweepy.Client(
+        # Tweepy Client v2 (Standard for Free tier)
+        # Note: We use OAuth 1.0a User Context for posting.
+        self.client = tweepy.Client(
             consumer_key=X_API_KEY,
             consumer_secret=X_API_SECRET,
             access_token=X_ACCESS_TOKEN,
-            access_token_secret=X_ACCESS_SECRET
+            access_token_secret=X_ACCESS_SECRET,
+            wait_on_rate_limit=True
         )
         
         # OpenRouter Client
@@ -59,14 +54,21 @@ class XBot:
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     def is_already_processed(self, tweet_id: str):
-        response = self.supabase.table("processed_tweets").select("tweet_id").eq("tweet_id", str(tweet_id)).execute()
-        return len(response.data) > 0
+        try:
+            response = self.supabase.table("processed_tweets").select("tweet_id").eq("tweet_id", str(tweet_id)).execute()
+            return len(response.data) > 0
+        except Exception as e:
+            print(f"Supabase error: {e}")
+            return False
 
     def mark_as_processed(self, tweet_id: str, username: str):
-        self.supabase.table("processed_tweets").insert({
-            "tweet_id": str(tweet_id),
-            "username": username
-        }).execute()
+        try:
+            self.supabase.table("processed_tweets").insert({
+                "tweet_id": str(tweet_id),
+                "username": username
+            }).execute()
+        except Exception as e:
+            print(f"Supabase record error: {e}")
 
     def clean_html(self, raw_html):
         cleanr = re.compile('<.*?>')
@@ -105,24 +107,23 @@ class XBot:
             return None
 
     def run(self):
-        print("Starting bot execution (Hybrid Mode - FREE)...")
+        print("Starting bot execution (X API v2 Mode - FREE)...")
         for username in TARGET_USERNAMES:
             username = username.strip()
-            success = False
+            print(f"Checking @{username}...")
             
+            success = False
             for instance in NITTER_INSTANCES:
-                print(f"Checking updates for @{username} via {instance}...")
                 rss_url = f"{instance}/{username}/rss"
-                
                 try:
                     feed = feedparser.parse(rss_url)
                     if not feed.entries:
                         continue
                     
                     success = True
+                    # Process entries (limit to avoid spam)
                     entries = sorted(feed.entries, key=lambda x: x.published_parsed if hasattr(x, 'published_parsed') else 0)
-                    
-                    for entry in entries[-5:]:
+                    for entry in entries[-3:]:
                         tweet_id = self.extract_tweet_id(entry.link)
                         if not tweet_id or self.is_already_processed(tweet_id):
                             continue
@@ -132,7 +133,7 @@ class XBot:
                             self.mark_as_processed(tweet_id, username)
                             continue
 
-                        print(f"Processing new tweet: {tweet_id}")
+                        print(f"Processing tweet: {tweet_id}")
                         jp_text = self.process_tweet_content(clean_text)
                         if not jp_text:
                             continue
@@ -141,29 +142,20 @@ class XBot:
                         full_text = f"{jp_text}\n\n{tweet_url}"
                         
                         try:
-                            # Try v1.1 first
-                            self.api.update_status(status=full_text)
-                            print(f"Successfully posted (v1.1) for {tweet_id}")
+                            # Use v2 API (The only one that works for posting on Free tier)
+                            self.client.create_tweet(text=full_text)
+                            print(f"Successfully posted for {tweet_id}")
                             self.mark_as_processed(tweet_id, username)
-                            time.sleep(5)
-                        except Exception as e1:
-                            print(f"v1.1 failed, trying v2: {e1}")
-                            try:
-                                # Try v2 as fallback
-                                self.client_v2.create_tweet(text=full_text)
-                                print(f"Successfully posted (v2) for {tweet_id}")
-                                self.mark_as_processed(tweet_id, username)
-                                time.sleep(5)
-                            except Exception as e2:
-                                print(f"Both v1.1 and v2 failed for {tweet_id}: {e2}")
+                            time.sleep(10) # 念のため10秒空ける
+                        except Exception as e:
+                            print(f"Post failed: {e}")
                     
                     break
-                    
                 except Exception as e:
-                    print(f"Error with instance {instance}: {e}")
+                    print(f"Error with {instance}: {e}")
             
             if not success:
-                print(f"No connection for @{username}.")
+                print(f"Failed to fetch @{username} from all instances.")
         
         print("Bot execution finished.")
 
